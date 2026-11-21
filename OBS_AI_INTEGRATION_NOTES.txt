@@ -1,0 +1,945 @@
+OBS + ИИ-АССИСТЕНТ: ЗАМЕТКИ ПО ИНТЕГРАЦИИ
+Дата: 21.11.2026
+Проект: голосовой ИИ-ассистент в OBS (см. README.md)
+Статус: документация OBS изучена по официальным источникам; методы отобраны.
+        Практического запуска в OBS на этой машине не было.
+
+======================================================================
+1. КОРОТКИЙ ВЫВОД
+======================================================================
+
+Для проекта нужны три независимых слоя:
+
+  1) ИИ-логика (LLM, STT, TTS, принятие решений);
+  2) управление OBS (сцены, источники, звук, видимость);
+  3) отображение аватара и эмоций (HTML/CSS/JS или картинки).
+
+Рекомендуемая схема для MVP:
+
+  [Python-сервис ИИ] --HTTP--> [LLM / TTS / STT]
+          |
+          | WebSocket :8765
+          v
+  [Browser Source "AI Avatar"]  <-- сцена OBS
+          ^
+          | obs-websocket :4455
+  [OBS Studio]
+
+Почему так:
+  - OBS-скрипт на Python удобен для доступа к OBS "изнутри", но у него
+    ограничения по версии Python, GIL и установке тяжёлых зависимостей;
+  - obs-websocket даёт почти полный удалённый контроль над OBS и события;
+  - browser source — лучший способ отрисовать аватар с эмоциями,
+    прозрачным фоном, анимацией и звуком;
+  - ИИ-сервис можно запускать отдельно, отлаживать и обновлять
+    независимо от OBS.
+
+Для самого первого прототипа можно сделать всё внутри одного
+Python-скрипта OBS, но для нормальной разработки лучше гибрид:
+тонкий OBS-скрипт (хоткеи, настройки, события) + внешний сервис ИИ.
+
+======================================================================
+2. УРОВНИ API OBS
+======================================================================
+
+1) libobs (C/C++)
+   - ядро OBS: источники, сцены, фильтры, вывод, аудио, графика;
+   - основной интерфейс для нативных плагинов;
+   - структура obs_source_info: id, type, output_flags, create, destroy,
+     update, get_width, get_height, video_tick, video_render, media_*;
+   - регистрация через obs_register_source().
+   - Для ИИ-ассистента нативный плагин не обязателен: это самый сложный
+     путь (C/C++, сборка под Windows, обновления OBS).
+
+2) Скрипты OBS (Python / Lua)
+   - Python-обёртка obspython и Lua-обёртка obslua;
+   - почти все функции libobs доступны как функции модуля;
+   - плюс свои функции: script_*(), timer_add/remove(), hotkeys,
+     frontend callbacks, обёртки списков;
+   - Python не встроен в OBS: нужен установленный Python (обычно 64-bit)
+     и указание пути в Tools -> Scripts -> Python Settings;
+   - LuaJIT встроен, но библиотек и примеров для ИИ меньше.
+
+3) obs-websocket (внешнее управление)
+   - встроен в OBS 28+;
+   - WebSocket + JSON, по умолчанию порт 4455;
+   - запросы (requests), события (events), пакеты запросов (batch);
+   - лучшее решение для связи OBS с внешним ИИ-сервисом.
+
+4) Browser Source (presentation layer)
+   - полноценный Chromium внутри OBS;
+   - HTML/CSS/JS, прозрачный фон, звук, анимации;
+   - может общаться с локальным сервисом по WebSocket;
+   - имеет JS API window.obsstudio для чтения состояния OBS и
+     управления стримом/записью (при выдаче разрешений).
+
+======================================================================
+3. PYTHON-СКРИПТ OBS: ЖИЗНЕННЫЙ ЦИКЛ И UI
+======================================================================
+
+Глобальные функции, которые вызывает OBS:
+
+  script_description()          описание скрипта в окне Scripts
+  script_defaults(settings)     значения по умолчанию
+  script_load(settings)         инициализация, подписки, хоткеи
+  script_update(settings)       реакция на изменение настроек
+  script_properties()           построение UI свойств
+  script_tick(seconds)          каждый кадр (в Python не рекомендуется)
+  script_save(settings)         перед сохранением настроек
+  script_unload()               при выгрузке скрипта
+  script_path()                 путь к текущему .py/.lua файлу
+
+Важно:
+  - при старте OBS скрипты загружаются ДО сцен и источников;
+  - искать источники в script_load() рано, лучше дождаться
+    OBS_FRONTEND_EVENT_FINISHED_LOADING;
+  - script_tick() в Python нежелателен из-за GIL, используйте timer_add();
+  - в script_unload() нужно снять таймеры, хоткеи и callbacks.
+
+Таймеры (обёртки obspython/obslua):
+
+  timer_add(callback, milliseconds)   периодический вызов
+  timer_remove(callback)             остановить
+  remove_current_callback()           остановить изнутри callback
+
+UI и настройки:
+
+  obs_properties_create()
+  obs_properties_add_text(props, key, label, type)
+  obs_properties_add_bool(props, key, label)
+  obs_properties_add_int(props, key, label, min, max, step)
+  obs_properties_add_list(props, key, label, type, format)
+  obs_properties_add_path(props, key, label, type, filter, default)
+  obs_properties_add_button(props, key, label, callback)
+  obs_property_set_modified_callback(prop, callback)
+  obs_properties_apply_settings(props, settings)
+  obs_properties_destroy(props)
+
+  obs_data_create()
+  obs_data_set_string/bool/int/double/obj/array()
+  obs_data_get_string/bool/int/double/obj/array()
+  obs_data_release()
+
+Хоткеи:
+
+  obs_hotkey_register_frontend(name, description, callback)
+  obs_hotkey_unregister(callback)
+  obs_hotkey_register_source(source, name, description, callback)
+
+  В Python callback фронтенд-хоткея получает один параметр pressed (bool),
+  как описано в scripting guide.
+
+======================================================================
+4. УПРАВЛЕНИЕ СЦЕНАМИ И ИСТОЧНИКАМИ (IN-PROCESS)
+======================================================================
+
+4.1. Поиск и создание
+
+  obs_get_source_by_name(name)          -> новая ссылка, нужен release
+  obs_source_create(id, name, settings, hotkey_data)
+  obs_source_release(source)
+  obs_source_remove(source)             пометить источник на удаление
+  obs_source_get_name(source)
+  obs_source_set_name(source, name)
+  obs_source_get_uuid(source)
+  obs_source_get_id(source)             версионированный id, например *_v3
+  obs_source_get_unversioned_id(source) id без _vN
+  obs_source_get_type(source)
+  obs_source_is_scene(source)
+  obs_source_is_group(source)
+  obs_source_get_width(source)
+  obs_source_get_height(source)
+
+  obs_enum_sources()                    список источников
+  source_list_release(list)             освободить список
+
+4.2. Настройки источника
+
+  obs_source_get_settings(source)        -> +1 к ссылке, нужен release
+  obs_data_set_string(settings, "file", path)
+  obs_source_update(source, settings)
+  obs_data_release(settings)
+
+  obs_source_properties(source)         узнать доступные параметры
+  obs_properties_get(props, key)
+  obs_property_next(prop)
+  obs_property_get_name(prop)
+  obs_property_get_description(prop)
+  obs_property_get_type(prop)
+  obs_source_update_properties(source)
+
+  obs_source_get_defaults(id)           настройки по умолчанию для типа
+
+4.3. Сцены и scene item
+
+  obs_frontend_get_current_scene()      -> новая ссылка, release
+  obs_frontend_set_current_scene(scene)
+  obs_scene_from_source(source)         заимствованная ссылка, НЕ release
+  obs_scene_add(scene, source)          -> scene item (заимствованный)
+  obs_scene_find_source(scene, name)
+  obs_scene_find_source_recursive(scene, name)
+  obs_scene_find_sceneitem_by_id(scene, id)
+  obs_scene_enum_items(scene)           список, release через
+                                        sceneitem_list_release()
+  obs_sceneitem_get_id(item)
+  obs_sceneitem_get_source(item)
+  obs_sceneitem_remove(item)
+
+  obs_sceneitem_set_visible(item, bool)
+  obs_sceneitem_visible(item)
+  obs_sceneitem_set_locked(item, bool)
+  obs_sceneitem_set_pos(item, vec2)
+  obs_sceneitem_set_rot(item, degrees)
+  obs_sceneitem_set_scale(item, vec2)
+  obs_sceneitem_set_alignment(item, OBS_ALIGN_*)
+  obs_sceneitem_set_bounds_type(item, type)
+  obs_sceneitem_set_bounds(item, vec2)
+  obs_sceneitem_set_crop(item, {left, top, right, bottom})
+  obs_sceneitem_set_order(item, OBS_ORDER_MOVE_*)
+  obs_sceneitem_set_order_position(item, index)
+
+4.4. Аудио, медиа, фильтры
+
+  obs_source_set_volume(source, float)  линейный множитель; 1.0 = 0 dB
+  obs_source_get_volume(source)
+  obs_source_set_muted(source, bool)
+  obs_source_muted(source)
+  obs_source_set_audio_mixers(source, mask)
+  obs_source_set_sync_offset(source, ns)
+  obs_source_set_monitoring_type(source, type)
+
+  obs_source_media_play_pause(source, pause)
+  obs_source_media_restart(source)
+  obs_source_media_stop(source)
+  obs_source_media_next(source)
+  obs_source_media_previous(source)
+  obs_source_media_get_state(source)
+  obs_source_media_get_duration(source)
+  obs_source_media_get_time(source)
+  obs_source_media_set_time(source, ms)
+
+  obs_source_filter_add(source, filter)
+  obs_source_filter_remove(source, filter)
+  obs_source_filter_set_order(source, filter, order)
+  obs_source_set_enabled(filter, bool)
+  obs_source_enabled(filter)
+
+4.5. Frontend API
+
+  obs_frontend_get_scenes(list)         сцены в порядке панели Scenes
+  obs_frontend_source_list_free(list)
+  obs_frontend_get_current_scene()
+  obs_frontend_set_current_scene(scene)
+  obs_frontend_get_current_transition()
+  obs_frontend_set_current_transition(transition)
+  obs_frontend_add_event_callback(callback, private_data)
+  obs_frontend_remove_event_callback(callback, private_data)
+  obs_frontend_save()
+  obs_frontend_streaming_start/stop/active()
+  obs_frontend_recording_start/stop/active()
+  obs_frontend_recording_pause()
+  obs_frontend_replay_buffer_start/stop/save/active()
+  obs_frontend_start_virtualcam/stop_virtualcam/virtualcam_active()
+  obs_frontend_take_source_screenshot(...)
+
+Полезные события фронтенда:
+
+  OBS_FRONTEND_EVENT_FINISHED_LOADING
+  OBS_FRONTEND_EVENT_SCENE_CHANGED
+  OBS_FRONTEND_EVENT_SCENE_LIST_CHANGED
+  OBS_FRONTEND_EVENT_TRANSITION_CHANGED
+  OBS_FRONTEND_EVENT_STREAMING_STARTED / STOPPED
+  OBS_FRONTEND_EVENT_RECORDING_STARTED / STOPPED / PAUSED / UNPAUSED
+  OBS_FRONTEND_EVENT_REPLAY_BUFFER_STARTED / STOPPED / SAVED
+  OBS_FRONTEND_EVENT_VIRTUALCAM_STARTED / STOPPED
+  OBS_FRONTEND_EVENT_STUDIO_MODE_ENABLED / DISABLED
+  OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN
+  OBS_FRONTEND_EVENT_EXIT
+
+======================================================================
+5. ИСТОЧНИКИ ДЛЯ АВАТАРА, КАРТИНОК И ГОЛОСА
+======================================================================
+
+5.1. image_source — статичная картинка
+
+  id: "image_source"
+  ключи настроек:
+    "file"          путь к PNG/JPG/WebP и т.п.
+    "unload"        выгружать текстуру, когда источник не виден
+    "linear_alpha"  линейная альфа (для корректного смешивания)
+
+  Как менять картинку:
+    settings = obs_source_get_settings(source)
+    obs_data_set_string(settings, "file", new_path)
+    obs_source_update(source, settings)
+    obs_data_release(settings)
+
+  Подходит для:
+    - статичного аватара;
+    - заранее заготовленных эмоций (happy.png, angry.png, ...);
+    - быстрой замены изображения без HTML.
+
+  Ограничения:
+    - нет анимации и плавных переходов "из коробки";
+    - при замене файла с тем же путём возможен кэш/блокировка файла;
+      надёжнее менять путь или использовать уникальные имена;
+    - для эмоций удобнее несколько image_source и переключать
+      видимость scene item, а не перезагружать один источник.
+
+5.2. slideshow — слайд-шоу эмоций
+
+  id: "slideshow" (version 2)
+  ключи:
+    "files"             массив объектов {"value": "путь"}
+    "slide_time"        время показа, мс (по умолчанию 2000)
+    "transition"        "cut" | "fade" | "swipe" | "slide"
+    "transition_speed"  длительность перехода, мс (по умолчанию 700)
+    "randomize"         bool
+    "loop"              bool
+    "playback_mode"     "once" | "loop" | "random"
+    "slide_mode"        "mode_auto" | "mode_manual"
+    "hide"              скрыть после последнего слайда
+  медиа-управление:
+    obs_source_media_next(source) / previous(source)
+    obs_source_media_play_pause(source, ...)
+
+  Подходит, если эмоции — набор статичных картинок и нужен
+  автоматический показ. Для сложной мимики и липсинка лучше browser source.
+
+5.3. browser_source — основной вариант для аватара
+
+  id: "browser_source"
+  ключи:
+    "url"                  адрес страницы (http://127.0.0.1:8765/avatar)
+    "is_local_file"        true, если использовать local_file
+    "local_file"           путь к локальному HTML
+    "width", "height"      viewport браузера (например 1920x1080)
+    "fps_custom"           bool
+    "fps"                  custom FPS
+    "css"                  пользовательский CSS
+    "shutdown"             выгружать страницу, когда источник не виден
+    "restart_when_active"  перезагружать при активации сцены
+    "reroute_audio"        true = звук страницы идёт через OBS
+    "webpage_control_level" уровень доступа страницы к OBS
+
+  Почему это лучший вариант для аватара:
+    - прозрачный фон (body background: transparent);
+    - HTML/CSS/JS: эмоции, моргание, движение, частицы, lip sync;
+    - можно менять состояние без перезагрузки страницы:
+      страница открывает WebSocket к локальному сервису и получает
+      команды {"type":"emotion","value":"happy"} и т.п.;
+    - можно проигрывать TTS-аудио через Web Audio/HTMLAudioElement;
+    - при "reroute_audio": true звук попадает в микс OBS и в стрим.
+
+  Важно:
+    - не надо менять "url" на каждый чих: это перезагружает страницу
+      и даёт мигание; для живых состояний используйте WebSocket/JS;
+    - если всё же нужно принудительно обновить страницу:
+      obs-websocket PressInputPropertiesButton с propertyName
+      "refreshnocache" (кнопка Refresh cache of current page);
+    - window.obsstudio даёт странице ограниченный API OBS:
+      getStatus, getCurrentScene, getScenes, getTransitions,
+      setCurrentScene, startStreaming/stopStreaming,
+      startRecording/stopRecording, startVirtualcam/stopVirtualcam,
+      saveReplayBuffer и др.;
+    - доступ выдаётся через "Page permissions" (read / control OBS).
+
+5.4. text_gdiplus / text_ft2_source — текст и субтитры
+
+  Windows: "text_gdiplus" (версии 2/3), macOS/Linux: "text_ft2_source".
+  ключи:
+    "text"            сам текст
+    "font"            объект: face, size, flags (bold/italic/...)
+    "color"           цвет текста
+    "outline"         bool
+    "outline_size"    толщина обводки
+    "outline_color"   цвет обводки
+    "align", "valign" выравнивание
+    "extents"         bool, использовать ли ограничивающий прямоугольник
+    "extents_wrap"    перенос строк
+    "extents_cx/cy"   размеры области
+    "read_from_file"  читать текст из файла
+    "file"            путь к файлу
+    "chatlog"         режим лога чата
+
+  Для ИИ-ассистента:
+    - реплики, субтитры, статус ("слушаю", "думаю", "говорю");
+    - обновление через obs_source_update() или obs-websocket
+      SetInputSettings;
+    - для длинного текста включить extents_wrap и задать ширину.
+
+5.5. ffmpeg_source — TTS и видео
+
+  id: "ffmpeg_source"
+  ключи:
+    "is_local_file"       true для локального файла
+    "local_file"          путь к аудио/видео
+    "input"               URL/поток, если не локальный файл
+    "looping"             bool
+    "restart_on_activate" bool
+    "clear_on_media_end"  bool
+    "close_when_inactive" bool
+    "hw_decode"           bool
+    "speed_percent"       скорость
+    "ffmpeg_options"      дополнительные опции
+
+  Сценарий TTS:
+    1) ИИ-сервис синтезирует речь в WAV/MP3;
+    2) обновляет local_file у media source;
+    3) вызывает obs_source_media_restart(source) (или
+       obs-websocket TriggerMediaInputAction RESTART);
+    4) аватар получает команду "говорить" и анимирует рот;
+    5) по сигналу media_ended аватар возвращается в idle.
+
+  Альтернатива: играть TTS прямо в browser source через Web Audio.
+  Тогда проще синхронизировать звук и анимацию, но нужно проверить
+  маршрутизацию звука (reroute_audio) и автозапуск аудио в CEF.
+
+5.6. Скриншоты для "зрения" ИИ
+
+  Внутри OBS:
+    obs_frontend_take_source_screenshot(...)
+  Через obs-websocket:
+    GetSourceScreenshot   -> base64 PNG/JPG, совместим с inputs и scenes
+    SaveSourceScreenshot  -> сохранить в файл
+  Это позволяет ИИ "увидеть" текущую сцену/аватар/игру и отреагировать.
+
+======================================================================
+6. OBS-WEBSOCKET: ВНЕШНЕЕ УПРАВЛЕНИЕ
+======================================================================
+
+6.1. Подключение
+
+  - OBS 28+ содержит obs-websocket 5.x;
+  - включение: Tools -> WebSocket Server Settings;
+  - по умолчанию порт 4455;
+  - можно включить аутентификацию (пароль);
+  - протокол: WebSocket, JSON, opcodes:
+      0 Hello, 1 Identify, 2 Identified, 3 Reidentify,
+      5 Event, 6 Request, 7 RequestResponse, 8 RequestBatch,
+      9 RequestBatchResponse;
+  - аутентификация: SHA256(password + salt), затем SHA256(secret + challenge),
+    base64; клиентские библиотеки делают это сами;
+  - не открывайте порт 4455 в интернет без пароля и firewall.
+
+Python-клиенты:
+  - obsws-python (sync, Python 3.10+): ReqClient;
+  - simpleobsws (async, Python 3.7+);
+  - старые клиенты для protocol v4 несовместимы с OBS 28+.
+
+Пример (внешний сервис, не внутри OBS):
+
+  from obsws_python import ReqClient
+
+  cl = ReqClient(host="127.0.0.1", port=4455,
+                 password="ПАРОЛЬ", timeout=3)
+
+  cl.set_current_program_scene("AI Assistant")
+  cl.set_input_settings(
+      "AI Avatar",
+      {"url": "http://127.0.0.1:8765/avatar"},
+      overlay=True,
+  )
+
+6.2. Запросы, которые пригодятся
+
+  Сцены:
+    GetSceneList
+    GetCurrentProgramScene
+    SetCurrentProgramScene
+    CreateScene
+    RemoveScene
+    SetSceneName
+    GetCurrentPreviewScene / SetCurrentPreviewScene (studio mode)
+    TriggerStudioModeTransition / SetStudioModeEnabled
+
+  Источники:
+    GetInputList
+    GetInputKindList
+    GetInputDefaultSettings
+    GetInputSettings
+    SetInputSettings          (overlay=true — слить с текущими)
+    CreateInput
+    RemoveInput
+    SetInputName
+    GetInputMute / SetInputMute / ToggleInputMute
+    GetInputVolume / SetInputVolume
+    GetInputAudioTracks / SetInputAudioTracks
+    GetInputAudioMonitorType / SetInputAudioMonitorType
+    GetSourceActive
+    GetSourceScreenshot / SaveSourceScreenshot
+    GetInputPropertiesListPropertyItems
+    PressInputPropertiesButton (например, refreshnocache)
+    OpenInputPropertiesDialog
+    OpenInputFiltersDialog
+    OpenInputInteractDialog
+
+  Scene items:
+    GetSceneItemList
+    GetGroupSceneItemList
+    GetSceneItemId
+    GetSceneItemSource
+    CreateSceneItem
+    RemoveSceneItem
+    DuplicateSceneItem
+    GetSceneItemTransform / SetSceneItemTransform
+    GetSceneItemEnabled / SetSceneItemEnabled
+    GetSceneItemLocked / SetSceneItemLocked
+    GetSceneItemIndex / SetSceneItemIndex
+    GetSceneItemBlendMode / SetSceneItemBlendMode
+
+  Медиа:
+    GetMediaInputStatus
+    SetMediaInputCursor
+    OffsetMediaInputCursor
+    TriggerMediaInputAction  (PLAY/PAUSE/STOP/RESTART/NEXT/PREVIOUS)
+
+  Фильтры:
+    GetSourceFilterList
+    CreateSourceFilter
+    RemoveSourceFilter
+    SetSourceFilterSettings
+    SetSourceFilterEnabled
+    SetSourceFilterIndex
+
+  Выходы:
+    GetStreamStatus / StartStream / StopStream / ToggleStream
+    GetRecordStatus / StartRecord / StopRecord / ToggleRecord
+    PauseRecord / ResumeRecord
+    GetVirtualCamStatus / StartVirtualCam / StopVirtualCam / ToggleVirtualCam
+    GetReplayBufferStatus / StartReplayBuffer / StopReplayBuffer /
+    SaveReplayBuffer
+    SendStreamCaption (CEA-608, не путать с текстовым источником)
+
+  Служебное:
+    GetVersion
+    GetStats
+    BroadcastCustomEvent
+    CallVendorRequest
+    GetHotkeyList / TriggerHotkeyByName / TriggerHotkeyByKeySequence
+    Sleep (в batch)
+
+6.3. События, на которые можно реагировать
+
+  CurrentProgramSceneChanged
+  SceneCreated / SceneRemoved / SceneNameChanged
+  InputCreated / InputRemoved / InputNameChanged / InputSettingsChanged
+  InputMuteStateChanged / InputVolumeChanged
+  SceneItemEnableStateChanged / SceneItemTransformChanged
+  MediaInputPlaybackStarted / MediaInputPlaybackEnded /
+  MediaInputActionTriggered
+  StreamStateChanged / RecordStateChanged / VirtualcamStateChanged
+  ReplayBufferSaved
+  CustomEvent / VendorEvent
+  CurrentSceneCollectionChanging / Changed
+  CurrentProfileChanging / Changed
+  ExitStarted
+
+  Высокочастотные события (InputVolumeMeters,
+  SceneItemTransformChanged, InputActiveStateChanged,
+  InputShowStateChanged) нужно явно подписывать.
+
+6.4. Пакеты запросов
+
+  RequestBatch (op 8) позволяет выполнить несколько запросов подряд.
+  ExecutionType:
+    SerialRealtime — максимально быстро;
+    SerialFrame    — синхронно с графическим кадром (анимации);
+    Parallel       — параллельно (например, скриншоты).
+  Внутри batch можно использовать Sleep (sleepMillis/sleepFrames).
+  Это удобно для плавного движения аватара:
+    SetSceneItemTransform -> Sleep -> SetSceneItemTransform -> ...
+
+6.5. Примеры JSON
+
+  SetInputSettings (сменить URL browser source):
+
+    {"op":6,"d":{
+      "requestType":"SetInputSettings",
+      "requestId":"1",
+      "requestData":{
+        "inputName":"AI Avatar",
+        "inputSettings":{"url":"http://127.0.0.1:8765/avatar"},
+        "overlay":true
+      }
+    }}
+
+  CreateInput (создать browser source сразу в сцене):
+
+    {"op":6,"d":{
+      "requestType":"CreateInput",
+      "requestId":"2",
+      "requestData":{
+        "sceneName":"AI Assistant",
+        "inputName":"AI Avatar",
+        "inputKind":"browser_source",
+        "inputSettings":{
+          "url":"http://127.0.0.1:8765/avatar",
+          "width":1920,
+          "height":1080,
+          "reroute_audio":true
+        },
+        "sceneItemEnabled":true
+      }
+    }}
+
+  SetSceneItemTransform (сдвинуть/масштабировать аватар):
+
+    {"op":6,"d":{
+      "requestType":"SetSceneItemTransform",
+      "requestId":"3",
+      "requestData":{
+        "sceneName":"AI Assistant",
+        "sceneItemId":12,
+        "sceneItemTransform":{
+          "positionX":960,
+          "positionY":540,
+          "rotation":0,
+          "scaleX":1.0,
+          "scaleY":1.0,
+          "alignment":0,
+          "boundsType":"OBS_BOUNDS_NONE"
+        }
+      }
+    }}
+
+  TriggerMediaInputAction (перезапустить TTS):
+
+    {"op":6,"d":{
+      "requestType":"TriggerMediaInputAction",
+      "requestId":"4",
+      "requestData":{
+        "inputName":"AI Voice",
+        "mediaAction":"OBS_WEBSOCKET_MEDIA_INPUT_ACTION_RESTART"
+      }
+    }}
+
+  GetSourceScreenshot (для vision-модели):
+
+    {"op":6,"d":{
+      "requestType":"GetSourceScreenshot",
+      "requestId":"5",
+      "requestData":{
+        "sourceName":"AI Assistant",
+        "imageFormat":"png",
+        "imageWidth":1280,
+        "imageHeight":720
+      }
+    }}
+
+======================================================================
+7. КАК ЭТО СВЯЗАТЬ С ИИ-АССИСТЕНТОМ
+======================================================================
+
+Действие ИИ                -> метод OBS
+----------------------------------------------------------------------
+"покажи эмоцию"            -> WebSocket в browser source:
+                              {"type":"emotion","value":"happy"}
+                              (или SetInputSettings image_source "file",
+                               или переключение видимости scene item)
+"скажи текст"              -> TTS -> media source local_file +
+                              TriggerMediaInputAction RESTART;
+                              либо Web Audio в browser source
+"покажи субтитр"           -> SetInputSettings text_gdiplus/text_ft2_source
+                              {"text": "..."}
+"переключи сцену"          -> SetCurrentProgramScene
+"включи/выключи источник"  -> SetSceneItemEnabled
+"подвинь аватар"           -> SetSceneItemTransform (+ RequestBatch/Sleep)
+"увеличь/уменьши звук"     -> SetInputVolume (inputVolumeDb или Mul)
+"замьють микрофон"         -> SetInputMute / ToggleInputMute
+"запусти/останови стрим"   -> StartStream / StopStream
+"запусти/останови запись"  -> StartRecord / StopRecord
+"сохрани повтор"           -> SaveReplayBuffer
+"посмотри на сцену"        -> GetSourceScreenshot -> vision-модель
+"среагируй на событие"     -> подписка на CurrentProgramSceneChanged,
+                              MediaInputPlaybackEnded, StreamStateChanged
+"ответь на сообщение чата" -> внешний чат-сервис -> TTS + emotion
+
+Логика аватара:
+  - idle: лёгкое дыхание/моргание;
+  - listening: наклон/подсветка, "ушки";
+  - thinking: анимация загрузки;
+  - speaking: движение рта (по амплитуде TTS или по таймлайну);
+  - emotion: happy/sad/angry/surprised и т.п.
+  Всё это дешевле делать в HTML/CSS/JS browser source, а OBS
+  использовать как окно вывода и микшер.
+
+Липсинк:
+  - простой вариант: псевдо-липсинк по таймеру во время проигрывания TTS;
+  - точнее: анализировать аудио (RMS/FFT) в JS через Web Audio API
+    и двигать элементы лица;
+  - ещё точнее: TTS-сервис отдаёт viseme-таймлайн, JS проигрывает его.
+
+======================================================================
+8. ВАРИАНТЫ АРХИТЕКТУРЫ
+======================================================================
+
+A. Всё в одном OBS Python-скрипте
+   + один файл, простая установка, прямой доступ к OBS API;
+   - зависимости ИИ/TTS/STT ставятся в системный Python OBS;
+   - GIL, возможные фризы UI, сложная отладка;
+   - версия Python ограничена сборкой OBS.
+   Когда: быстрый прототип, минимум компонентов.
+
+B. Внешний Python-сервис + obs-websocket (рекомендуется)
+   + любые библиотеки и версии Python, удобная отладка;
+   + OBS не блокируется тяжёлыми вычислениями;
+   + легко разделить AI/STT/TTS/avatar;
+   - нужно запускать два процесса и настроить WebSocket/пароль;
+   - нужен контроль версий протокола.
+   Когда: основной вариант проекта.
+
+C. Гибрид: тонкий OBS-скрипт + внешний сервис
+   + настройки/хоткеи/события живут в OBS;
+   + ИИ и аватар — снаружи;
+   + можно сделать удобную панель управления в OBS;
+   - больше кода и точек интеграции.
+   Когда: полноценный продукт.
+
+D. Нативный плагин C/C++
+   + максимальная производительность, свои источники/фильтры,
+     доступ к GPU и аудио-пайплайну;
+   - долгая сборка, сложная поддержка, привязка к версии OBS.
+   Когда: нужен собственный источник/фильтр, которого нет в API.
+
+======================================================================
+9. ПРИМЕР PYTHON-СКРИПТА OBS (ЗАГОТОВКА)
+======================================================================
+
+Ниже — минимальный пример, как изнутри OBS создать/обновить
+browser source и image source. Это не готовый ассистент, а каркас.
+
+  import obspython as obs
+
+  AVATAR_NAME = "AI Avatar"
+  IMAGE_NAME = "AI Emotion"
+
+  def log(msg):
+      print("[AI Assistant] " + str(msg))
+
+  def get_scene():
+      scene_source = obs.obs_frontend_get_current_scene()
+      if not scene_source:
+          return None, None
+      scene = obs.obs_scene_from_source(scene_source)
+      return scene_source, scene
+
+  def ensure_browser_source():
+      src = obs.obs_get_source_by_name(AVATAR_NAME)
+      if src:
+          return src
+
+      settings = obs.obs_data_create()
+      obs.obs_data_set_string(settings, "url",
+                              "http://127.0.0.1:8765/avatar")
+      obs.obs_data_set_bool(settings, "is_local_file", False)
+      obs.obs_data_set_int(settings, "width", 1920)
+      obs.obs_data_set_int(settings, "height", 1080)
+      obs.obs_data_set_bool(settings, "reroute_audio", True)
+      obs.obs_data_set_bool(settings, "shutdown", False)
+      obs.obs_data_set_bool(settings, "restart_when_active", False)
+
+      src = obs.obs_source_create("browser_source", AVATAR_NAME,
+                                  settings, None)
+      obs.obs_data_release(settings)
+
+      scene_source, scene = get_scene()
+      if scene and src:
+          obs.obs_scene_add(scene, src)
+      if scene_source:
+          obs.obs_source_release(scene_source)
+      return src
+
+  def set_emotion_image(path):
+      src = obs.obs_get_source_by_name(IMAGE_NAME)
+      if not src:
+          settings = obs.obs_data_create()
+          obs.obs_data_set_string(settings, "file", path)
+          src = obs.obs_source_create("image_source", IMAGE_NAME,
+                                      settings, None)
+          obs.obs_data_release(settings)
+
+          scene_source, scene = get_scene()
+          if scene and src:
+              obs.obs_scene_add(scene, src)
+          if scene_source:
+              obs.obs_source_release(scene_source)
+      else:
+          settings = obs.obs_source_get_settings(src)
+          obs.obs_data_set_string(settings, "file", path)
+          obs.obs_source_update(src, settings)
+          obs.obs_data_release(settings)
+
+      if src:
+          obs.obs_source_release(src)
+
+  def script_load(settings):
+      src = ensure_browser_source()
+      if src:
+          log("avatar source ready")
+          obs.obs_source_release(src)
+      else:
+          log("failed to create avatar source")
+
+  def script_unload():
+      log("unloaded")
+
+  def script_description():
+      return "AI assistant: avatar + emotion sources"
+
+Замечания:
+  - в реальном коде ensure_browser_source() лучше вызывать после
+    OBS_FRONTEND_EVENT_FINISHED_LOADING, а не в script_load();
+  - obs_source_release() обязателен для ссылок, полученных через
+    obs_get_source_by_name() и obs_source_create();
+  - obs_scene_from_source() возвращает заимствованную ссылку,
+    её release не нужен;
+  - для управления из внешнего сервиса этот скрипт не обязателен:
+    те же действия делает obs-websocket.
+
+======================================================================
+10. ОГРАНИЧЕНИЯ И ГРАБЛИ
+======================================================================
+
+1) Python в OBS
+   - OBS использует внешний Python, не встроенный;
+   - разрядность должна совпадать (обычно 64-bit);
+   - путь задаётся в Tools -> Scripts -> Python Settings;
+   - поддерживаемая версия зависит от сборки OBS (в документации
+     указан диапазон 3.6–3.12; проверяйте для своей версии);
+   - pip install ставит пакеты в тот Python, который выбран в OBS;
+   - виртуальное окружение возможно, если указать OBS путь к его python.exe.
+
+2) Потоки
+   - не вызывайте функции OBS из произвольных потоков;
+   - сеть/ИИ/TTS лучше держать в отдельном процессе;
+   - внутри OBS используйте timer_add() и не блокируйте главный поток;
+   - script_tick() в Python может быть дорогим из-за GIL.
+
+3) Ссылки
+   - obs_get_source_by_name(), obs_source_create(),
+     obs_frontend_get_current_scene() возвращают новые ссылки;
+   - obs_source_get_settings() возвращает +1 к ссылке;
+   - всё это нужно освобождать;
+   - obs_scene_from_source(), obs_scene_add() — заимствованные ссылки;
+   - obs_enum_sources()/obs_scene_enum_items() — списки, их нужно
+     освобождать через source_list_release()/sceneitem_list_release();
+   - утечки ссылок приводят к падению OBS при выходе.
+
+4) Порядок загрузки
+   - скрипты грузятся до сцен/источников;
+   - ищите источники после OBS_FRONTEND_EVENT_FINISHED_LOADING;
+   - при смене scene collection старые указатели могут стать невалидными.
+
+5) Browser source
+   - смена URL перезагружает страницу;
+   - для живых состояний используйте WebSocket/JS, а не URL;
+   - кэш можно сбросить кнопкой refreshnocache;
+   - проверьте "Control audio via OBS" (reroute_audio), иначе звук
+     может уйти в устройство вывода и не попасть в стрим;
+   - CEF может не запускать аудио без пользовательского действия —
+     тестируйте autoplay в конкретной сборке OBS.
+
+6) Картинки
+   - image_source может держать файл/open handle;
+   - при перезаписи того же файла возможен кэш;
+   - для частой смены генерируйте уникальные имена или отдавайте
+     картинку через локальный HTTP-сервер с cache-busting;
+   - проверяйте размеры через obs_source_get_width/height
+     после загрузки.
+
+7) Безопасность
+   - не храните API-ключи ИИ в git;
+   - пароль obs-websocket не коммитьте;
+   - слушайте локальный интерфейс 127.0.0.1, если внешний доступ
+     не нужен;
+   - не открывайте 4455 в интернет без firewall/пароля.
+
+8) Версии
+   - имена source id могут быть версионированными (например,
+     text_gdiplus_v3); используйте obs_source_get_unversioned_id()
+     для логики и GetInputKindList для проверки;
+   - API obs-websocket 5.x может добавлять запросы без смены rpcVersion;
+     проверяйте GetVersion.
+
+======================================================================
+11. ПЛАН MVP
+======================================================================
+
+1) Сцена "AI Assistant":
+   - browser source "AI Avatar" (1920x1080, прозрачный фон);
+   - media source "AI Voice" (TTS WAV/MP3) или звук из browser source;
+   - text source "AI Caption" для субтитров.
+
+2) Локальный сервис Python (127.0.0.1):
+   - HTTP: отдаёт avatar.html и статику;
+   - WebSocket :8765: эмоции, состояние, аудио;
+   - LLM/STT/TTS: внешние API или локальные модели.
+
+3) Управление OBS:
+   - либо obs-websocket из сервиса;
+   - либо тонкий OBS-скрипт для хоткеев/настроек/событий;
+   - на старте проверить/создать источники, выставить настройки.
+
+4) Команды MVP:
+   - say(text) -> TTS + media + emotion "speaking";
+   - emotion(name) -> WebSocket в browser source;
+   - move(x, y, scale) -> SetSceneItemTransform;
+   - show_image(path) -> SetInputSettings image_source;
+   - switch_scene(name) -> SetCurrentProgramScene;
+   - screenshot() -> GetSourceScreenshot.
+
+5) Проверка:
+   - звук TTS слышен в записи/стриме;
+   - аватар не мигает при смене эмоции;
+   - после media_ended возвращается idle;
+   - при смене сцены источники не теряются;
+   - OBS не падает при выходе (нет утечек ссылок).
+
+======================================================================
+12. ЧТО ИМЕННО ИЗУЧЕНО (ДЛЯ ОТЧЁТА)
+======================================================================
+
+- Официальный Scripting Guide OBS: жизненный цикл скриптов, Python/Lua,
+  таймеры, хоткеи, frontend callbacks, отличия скриптового API.
+- Reference Sources: создание/обновление/удаление источников, настройки,
+  ссылки, аудио, медиа, фильтры, сигналы.
+- Reference Scenes: сцены, scene item, transform, видимость, порядок.
+- Reference Frontend API: сцены, переходы, события, стрим/запись,
+  virtualcam, replay buffer.
+- obs-websocket 5.x Protocol: opcodes, авторизация, запросы, события,
+  batch, ключевые request-имена.
+- Browser Source: настройки, прозрачность, звук, window.obsstudio.
+- Image/Slideshow/Text/FFmpeg source: ключи настроек и способы
+  динамического обновления.
+- Варианты архитектуры: in-process script, external obs-websocket,
+  hybrid, native plugin; выбран рекомендуемый гибрид.
+
+======================================================================
+13. ИСТОЧНИКИ
+======================================================================
+
+- OBS Scripting Guide:
+  https://obsproject.com/kb/scripting-guide
+- OBS Scripting API:
+  https://obsproject.com/docs/scripting.html
+- OBS Reference: Sources:
+  https://obsproject.com/docs/reference-sources.html
+- OBS Reference: Scenes:
+  https://obsproject.com/docs/reference-scenes.html
+- OBS Reference: Frontend API:
+  https://obsproject.com/docs/reference-frontend-api.html
+- obs-websocket protocol:
+  https://github.com/obsproject/obs-websocket/blob/master/docs/generated/protocol.md
+- obs-websocket (репозиторий и клиенты):
+  https://github.com/obsproject/obs-websocket
+- Browser Source (OBS KB):
+  https://obsproject.com/kb/browser-source
+- obs-browser (window.obsstudio):
+  https://github.com/obsproject/obs-browser
+- obsws-python:
+  https://github.com/aatikturk/obsstudio_sdk
+- simpleobsws:
+  https://github.com/IRLToolkit/simpleobsws
+
+КОНЕЦ.
